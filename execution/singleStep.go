@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/getgauge/common"
 	"github.com/getgauge/gauge-proto/go/gauge_messages"
@@ -16,14 +15,15 @@ import (
 	"github.com/getgauge/gauge/config"
 	"github.com/getgauge/gauge/env"
 	"github.com/getgauge/gauge/execution/event"
+	"github.com/getgauge/gauge/execution/rerun"
 	"github.com/getgauge/gauge/execution/result"
 	"github.com/getgauge/gauge/gauge"
 	"github.com/getgauge/gauge/logger"
-	"github.com/getgauge/gauge/parser"
 	"github.com/getgauge/gauge/plugin/install"
 	"github.com/getgauge/gauge/reporter"
 	"github.com/getgauge/gauge/runner"
 	"github.com/getgauge/gauge/skel"
+	"github.com/getgauge/gauge/validation"
 )
 
 type ExecutionStatus struct {
@@ -115,15 +115,7 @@ func startAPI(debug bool) runner.Runner {
 	return nil
 }
 
-var ExecuteStep = func(step *gauge.Step) int {
-
-	startTime := time.Now()
-	failed := 0
-	skipped := 0
-
-	if err := validateFlags(); err != nil {
-		logger.Fatal(true, err.Error())
-	}
+var ExecuteStep = func(step *gauge.Step, specDir []string) int {
 
 	if config.CheckUpdates() {
 		i := &install.UpdateFacade{}
@@ -147,47 +139,38 @@ var ExecuteStep = func(step *gauge.Step) int {
 		}
 	}()
 
-	_, res, err := parser.ParseConcepts()
-	if err != nil {
-		logger.Fatalf(true, "Unable to parse concepts: %s", err.Error())
-		return ExecutionFailed
+	res := validation.ValidateSpecs(specDir, false)
+	if len(res.Errs) > 0 {
+		if res.ParseOk {
+			return ParseFailed
+		}
+		return ValidationFailed
 	}
-
-	if !res.Ok {
+	if res.SpecCollection.Size() < 1 {
+		logger.Infof(true, "No specifications found in %s.", strings.Join(specDir, ", "))
+		err := res.Runner.Kill()
+		if err != nil {
+			logger.Errorf(false, "unable to kill runner: %s", err.Error())
+		}
+		if res.ParseOk {
+			return Success
+		}
 		return ExecutionFailed
 	}
 
 	event.InitRegistry()
 	wg := &sync.WaitGroup{}
 	reporter.ListenExecutionEvents(wg)
+	rerun.ListenFailedScenarios(wg, specDir)
 	if env.SaveExecutionResult() {
 		ListenSuiteEndAndSaveResult(wg)
 	}
 	defer wg.Wait()
+	ei := newExecutionInfo(res.SpecCollection, res.Runner, nil, res.ErrMap, InParallel, 0)
 
-	e := &stepExecutor{
-		runner:               r,
-		stream:               0,
-		currentExecutionInfo: &gauge_messages.ExecutionInfo{},
-	}
-
-	protoStep := &gauge_messages.ProtoStep{}
-	stepResult := ExecuteSingleStep(e, step, protoStep)
-	if stepResult.GetFailed() {
-		failed++
-	} else if stepResult.GetSkippedScenario() {
-		skipped++
-	}
-
-	// attach an executor
-	executionTime := time.Since(startTime).Milliseconds()
-
-	logger.Infof(true, "\nTotal time taken: %s", time.Millisecond*time.Duration(executionTime))
-
-	if failed > 0 {
-		return ExecutionFailed
-	}
-	return Success
+	e := ei.getExecutor()
+	logger.Debug(true, "Run started")
+	return printExecutionResult(e.run(), res.ParseOk)
 }
 
 func ExecuteSingleStep(e *stepExecutor, step *gauge.Step, protoStep *gauge_messages.ProtoStep) *result.StepResult {
