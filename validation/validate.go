@@ -8,8 +8,8 @@
 Validation invokes language runner for every step in serial fashion with the StepValidateRequest and runner gets back with the StepValidateResponse.
 
 Step Level validation
-	1. Duplicate step implementation
-	2. Step implementation not found : Prints a step implementation stub for every unimplemented step
+ 1. Duplicate step implementation
+ 2. Step implementation not found : Prints a step implementation stub for every unimplemented step
 
 If there is a validation error it skips that scenario and executes other scenarios in the spec.
 */
@@ -39,6 +39,12 @@ var HideSuggestion bool
 
 type validator struct {
 	specsToExecute     []*gauge.Specification
+	runner             runner.Runner
+	conceptsDictionary *gauge.ConceptDictionary
+}
+
+type stepValidator struct {
+	stepToExecute      *gauge.Step
 	runner             runner.Runner
 	conceptsDictionary *gauge.ConceptDictionary
 }
@@ -135,7 +141,7 @@ func Validate(args []string) {
 	logger.Infof(true, "No errors found.")
 }
 
-//TODO : duplicate in execute.go. Need to fix runner init.
+// TODO : duplicate in execute.go. Need to fix runner init.
 func startAPI(debug bool) runner.Runner {
 	sc := api.StartAPI(debug)
 	select {
@@ -153,6 +159,14 @@ type ValidationResult struct {
 	Runner         runner.Runner
 	Errs           []error
 	ParseOk        bool
+}
+
+type StepValidationResult struct {
+	Step    *gauge.Step
+	ErrMap  *gauge.BuildErrors
+	Runner  runner.Runner
+	Errs    []error
+	ParseOk bool
 }
 
 // NewValidationResult creates a new Validation result
@@ -187,6 +201,67 @@ func ValidateSpecs(specsToValidate []string, debug bool) *ValidationResult {
 		return NewValidationResult(gauge.NewSpecCollection(specs, false), errMap, r, false)
 	}
 	return NewValidationResult(gauge.NewSpecCollection(specs, false), errMap, r, true)
+}
+
+// ValidateStep validates a single step and returns the validation result
+func ValidateStep(stepText string, debug bool, lineNo int, fileName string) *StepValidationResult {
+	logger.Debug(true, "Parsing started.")
+	_, res, err := parser.ParseConcepts()
+	if err != nil {
+		return &StepValidationResult{nil, nil, nil, []error{err}, false}
+	}
+	if !res.Ok {
+		return &StepValidationResult{nil, nil, nil, []error{errors.New("Parsing failed")}, false}
+	}
+
+	parsedStep, err := parser.ParseStep(stepText)
+	if err != nil {
+		return &StepValidationResult{nil, nil, nil, []error{err}, false}
+	}
+
+	parsedStep.LineNo = lineNo
+	parsedStep.FileName = fileName
+
+	r := startAPI(debug)
+	errMap := gauge.NewBuildErrors()
+
+	stepValue, err := parser.ExtractStepValueAndParams(parsedStep.LineText, parsedStep.HasInlineTable)
+	if err != nil {
+		return &StepValidationResult{parsedStep, errMap, r, []error{err}, false}
+	}
+	protoStepValue := gauge.ConvertToProtoStepValue(stepValue)
+
+	m := &gm.Message{
+		MessageType: gm.Message_StepValidateRequest,
+		StepValidateRequest: &gm.StepValidateRequest{
+			StepText:           parsedStep.Value,
+			NumberOfParameters: int32(len(parsedStep.Args)),
+			StepValue:          protoStepValue,
+		},
+	}
+
+	response, err := r.ExecuteMessageWithTimeout(m)
+	if err != nil {
+		stepErr := NewStepValidationError(parsedStep, err.Error(), parsedStep.FileName, &invalidResponse, "")
+		errMap.StepErrs[parsedStep] = stepErr
+		return &StepValidationResult{parsedStep, errMap, r, []error{stepErr}, false}
+	}
+
+	if response.GetMessageType() == gm.Message_StepValidateResponse {
+		res := response.GetStepValidateResponse()
+		if !res.GetIsValid() {
+			msg := getMessage(res.GetErrorType().String())
+			suggestion := res.GetSuggestion()
+			stepErr := NewStepValidationError(parsedStep, msg, parsedStep.FileName, &res.ErrorType, suggestion)
+			errMap.StepErrs[parsedStep] = stepErr
+			return &StepValidationResult{parsedStep, errMap, r, []error{stepErr}, true}
+		}
+		return &StepValidationResult{parsedStep, errMap, r, nil, true}
+	}
+
+	stepErr := NewStepValidationError(parsedStep, "Invalid response from runner for Validation request", parsedStep.FileName, &invalidResponse, "")
+	errMap.StepErrs[parsedStep] = stepErr
+	return &StepValidationResult{parsedStep, errMap, r, []error{stepErr}, false}
 }
 
 func getErrMap(errMap *gauge.BuildErrors, validationErrors validationErrors) *gauge.BuildErrors {
@@ -270,6 +345,10 @@ func FilterDuplicates(validationErrors validationErrors) []error {
 }
 
 type validationErrors map[*gauge.Specification][]error
+
+func NewStepValidator(s *gauge.Step, r runner.Runner, c *gauge.ConceptDictionary) *stepValidator {
+	return &stepValidator{stepToExecute: s, runner: r, conceptsDictionary: c}
+}
 
 func NewValidator(s []*gauge.Specification, r runner.Runner, c *gauge.ConceptDictionary) *validator {
 	return &validator{specsToExecute: s, runner: r, conceptsDictionary: c}

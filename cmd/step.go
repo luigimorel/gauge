@@ -11,6 +11,8 @@ import (
 	"github.com/getgauge/gauge/execution"
 	"github.com/getgauge/gauge/execution/rerun"
 	"github.com/getgauge/gauge/gauge"
+	"github.com/getgauge/gauge/logger"
+	"github.com/getgauge/gauge/validation"
 	"github.com/spf13/cobra"
 )
 
@@ -36,10 +38,19 @@ func executeStep(cmd *cobra.Command) {
 	ensureScreenshotsDir()
 
 	args := cmd.Flags().Args()
+	if err := validateStepArgs(args); err != nil {
+		logger.Fatalf(true, "%s", err.Error())
+	}
+
 	parts := strings.Split(args[0], ":")
-	pathParts := strings.Split(parts[0], "/")
-	specFile := []string{pathParts[0]}
+	specFile := parts[0]
 	lineNo, _ := strconv.Atoi(parts[1])
+
+	// Get the actual step from the spec file
+	step, err := getStepFromSpecFile(specFile, lineNo)
+	if err != nil {
+		logger.Fatalf(true, "%s", err.Error())
+	}
 
 	if !skipCommandSave {
 		rerun.WritePrevArgs(os.Args)
@@ -47,16 +58,21 @@ func executeStep(cmd *cobra.Command) {
 
 	installMissingPlugins(installPlugins, false)
 
-	step := &gauge.Step{
-		Value:     strings.Join(args, " "),
-		LineText:  strings.Join(args, " "),
-		LineNo:    lineNo,
-		IsConcept: false,
+	validationResult := validation.ValidateStep(step.Value, false, step.LineNo, step.FileName)
+	if len(validationResult.Errs) > 0 {
+		logger.Fatalf(true, "Step validation failed: %v", validationResult.Errs[0])
 	}
 
-	exitCode := execution.ExecuteStep(step, specFile)
+	exitCode := execution.ExecuteStep(step, []string{specFile})
 	if failSafe && exitCode != execution.ParseFailed {
 		exitCode = 0
+	}
+
+	if validationResult.Runner != nil {
+		err = validationResult.Runner.Kill()
+		if err != nil {
+			logger.Errorf(false, "Unable to kill runner: %s", err.Error())
+		}
 	}
 
 	os.Exit(exitCode)

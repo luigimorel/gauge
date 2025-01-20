@@ -292,3 +292,33 @@ func HandleParseResult(results ...*ParseResult) bool {
 	}
 	return failed
 }
+
+func ParseStep(stepText string) (*gauge.Step, error) {
+	hasInlineTable := strings.Contains(stepText, "|")
+	stepValue, err := ExtractStepValueAndParams(stepText, hasInlineTable)
+	if err != nil {
+		return nil, err
+	}
+
+	step := &gauge.Step{
+		Value:    stepValue.StepValue,
+		LineText: stepText,
+		Args:     make([]*gauge.StepArg, 0),
+	}
+
+	for _, arg := range stepValue.Args {
+		if arg == string(gauge.TableArg) {
+			step.Args = append(step.Args, &gauge.StepArg{
+				ArgType: gauge.TableArg,
+				Value:   "",
+			})
+		} else {
+			step.Args = append(step.Args, &gauge.StepArg{
+				ArgType: gauge.Static,
+				Value:   arg,
+			})
+		}
+	}
+
+	return step, nil
+}

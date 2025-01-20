@@ -15,10 +15,10 @@ import (
 	"github.com/getgauge/gauge/config"
 	"github.com/getgauge/gauge/env"
 	"github.com/getgauge/gauge/execution/event"
-	"github.com/getgauge/gauge/execution/rerun"
 	"github.com/getgauge/gauge/execution/result"
 	"github.com/getgauge/gauge/gauge"
 	"github.com/getgauge/gauge/logger"
+	"github.com/getgauge/gauge/parser"
 	"github.com/getgauge/gauge/plugin/install"
 	"github.com/getgauge/gauge/reporter"
 	"github.com/getgauge/gauge/runner"
@@ -139,20 +139,30 @@ var ExecuteStep = func(step *gauge.Step, specDir []string) int {
 		}
 	}()
 
-	res := validation.ValidateSpecs(specDir, false)
-	if len(res.Errs) > 0 {
-		if res.ParseOk {
+	// Find the spec and scenario containing this step
+	specs, err := findSpecsContainingStep(step, specDir)
+	if err != nil {
+		logger.Errorf(true, "Failed to find specs containing step: %v", err)
+		return ExecutionFailed
+	}
+
+	errMap := gauge.NewBuildErrors()
+	validationStatus := validateSpecs(specs, errMap, r)
+
+	if !validationStatus.Ok {
+		if validationStatus.ParseErrors {
 			return ParseFailed
 		}
 		return ValidationFailed
 	}
-	if res.SpecCollection.Size() < 1 {
+
+	if specs.Size() < 1 {
 		logger.Infof(true, "No specifications found in %s.", strings.Join(specDir, ", "))
-		err := res.Runner.Kill()
+		err := r.Kill()
 		if err != nil {
 			logger.Errorf(false, "unable to kill runner: %s", err.Error())
 		}
-		if res.ParseOk {
+		if validationStatus.Ok {
 			return Success
 		}
 		return ExecutionFailed
@@ -161,16 +171,102 @@ var ExecuteStep = func(step *gauge.Step, specDir []string) int {
 	event.InitRegistry()
 	wg := &sync.WaitGroup{}
 	reporter.ListenExecutionEvents(wg)
-	rerun.ListenFailedScenarios(wg, specDir)
 	if env.SaveExecutionResult() {
 		ListenSuiteEndAndSaveResult(wg)
 	}
 	defer wg.Wait()
-	ei := newExecutionInfo(res.SpecCollection, res.Runner, nil, res.ErrMap, InParallel, 0)
 
+	ei := newExecutionInfo(specs, r, nil, errMap, InParallel, 0)
 	e := ei.getExecutor()
 	logger.Debug(true, "Run started")
-	return printExecutionResult(e.run(), res.ParseOk)
+	return printExecutionResult(e.run(), validationStatus.Ok)
+}
+
+// findSpecsContainingStep parses all specs in the given directories and returns the ones containing the given step
+func findSpecsContainingStep(step *gauge.Step, specDirs []string) (*gauge.SpecCollection, error) {
+	conceptDict, res, err := parser.ParseConcepts()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse concepts: %w", err)
+	}
+	if !res.Ok {
+		return nil, fmt.Errorf("failed to parse concepts")
+	}
+
+	errMap := gauge.NewBuildErrors()
+	specs, specsFailed := parser.ParseSpecs(specDirs, conceptDict, errMap)
+	if specsFailed {
+		return nil, fmt.Errorf("failed to parse specs")
+	}
+
+	var matchingSpecs []*gauge.Specification
+	for _, spec := range specs {
+		if containsStep(spec, step) {
+			matchingSpecs = append(matchingSpecs, spec)
+		}
+	}
+
+	if len(matchingSpecs) == 0 {
+		return nil, fmt.Errorf("no specs found containing step: %s", step.Value)
+	}
+
+	return gauge.NewSpecCollection(matchingSpecs, false), nil
+}
+
+// containsStep checks if the given spec contains the step
+func containsStep(spec *gauge.Specification, targetStep *gauge.Step) bool {
+	// Check context steps
+	for _, step := range spec.Contexts {
+		if stepsEqual(step, targetStep) {
+			return true
+		}
+	}
+
+	// Check scenario steps
+	for _, scenario := range spec.Scenarios {
+		for _, step := range scenario.Steps {
+			if stepsEqual(step, targetStep) {
+				return true
+			}
+		}
+	}
+
+	// Check teardown steps
+	for _, step := range spec.TearDownSteps {
+		if stepsEqual(step, targetStep) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// stepsEqual checks if two steps are equal by comparing their values and line numbers
+func stepsEqual(step1, step2 *gauge.Step) bool {
+	return step1.Value == step2.Value && step1.LineNo == step2.LineNo
+}
+
+// validateSpecs validates the specs using the runner
+func validateSpecs(specs *gauge.SpecCollection, errMap *gauge.BuildErrors, r runner.Runner) *ValidationStatus {
+	conceptDict, res, err := parser.ParseConcepts()
+	if err != nil {
+		return &ValidationStatus{Ok: false, ParseErrors: true}
+	}
+	if !res.Ok {
+		return &ValidationStatus{Ok: false, ParseErrors: true}
+	}
+
+	validator := validation.NewValidator(specs.Specs(), r, conceptDict)
+	validationErrors := validator.Validate()
+	if len(validationErrors) > 0 {
+		return &ValidationStatus{Ok: false}
+	}
+
+	return &ValidationStatus{Ok: true}
+}
+
+type ValidationStatus struct {
+	Ok          bool
+	ParseErrors bool
 }
 
 func ExecuteSingleStep(e *stepExecutor, step *gauge.Step, protoStep *gauge_messages.ProtoStep) *result.StepResult {
