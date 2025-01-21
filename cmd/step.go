@@ -84,7 +84,7 @@ func init() {
 
 func validateStepArgs(args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("Please provide a spec file and line number in format: specs/filename.spec:line-number")
+		return fmt.Errorf("Please provide a spec file and line number in format: specsDir/filename.spec:line-number")
 	}
 
 	matched, err := regexp.MatchString(`^specs/[^:]+\.spec:\d+$`, args[0])

@@ -7,13 +7,10 @@
 package execution
 
 import (
-	"time"
-
 	"github.com/getgauge/gauge-proto/go/gauge_messages"
 	"github.com/getgauge/gauge/execution/event"
 	"github.com/getgauge/gauge/execution/result"
 	"github.com/getgauge/gauge/gauge"
-	"github.com/getgauge/gauge/manifest"
 	"github.com/getgauge/gauge/plugin"
 	"github.com/getgauge/gauge/runner"
 )
@@ -23,9 +20,6 @@ type stepExecutor struct {
 	pluginHandler        plugin.Handler
 	currentExecutionInfo *gauge_messages.ExecutionInfo
 	stream               int
-	startTime            time.Time
-	manifest             *manifest.Manifest
-	stepResult           *result.StepResult
 }
 
 // TODO: stepExecutor should not consume both gauge.Step and gauge_messages.ProtoStep. The usage of ProtoStep should be eliminated.
@@ -103,16 +97,4 @@ func (e *stepExecutor) notifyAfterStepHook(stepResult *result.StepResult) {
 	}
 	m.StepExecutionEndingRequest.StepResult = gauge.ConvertToProtoStepResult(stepResult)
 	e.pluginHandler.NotifyPlugins(m)
-}
-
-func (e *stepExecutor) notifyExecutionResult() {
-	m := &gauge_messages.Message{MessageType: gauge_messages.Message_StepExecutionEnding,
-		StepExecutionEndingRequest: &gauge_messages.StepExecutionEndingRequest{StepResult: gauge.ConvertToProtoStepResult(e.stepResult)}}
-	e.pluginHandler.NotifyPlugins(m)
-}
-
-func (e *stepExecutor) start() {
-	e.startTime = time.Now()
-	event.Notify(event.NewExecutionEvent(event.StepStart, nil, nil, 0, &gauge_messages.ExecutionInfo{}))
-	e.pluginHandler = plugin.StartPlugins(e.manifest)
 }

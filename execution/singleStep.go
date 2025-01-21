@@ -116,7 +116,6 @@ func startAPI(debug bool) runner.Runner {
 }
 
 var ExecuteStep = func(step *gauge.Step, specDir []string) int {
-
 	if config.CheckUpdates() {
 		i := &install.UpdateFacade{}
 		i.BufferUpdateDetails()
@@ -139,33 +138,35 @@ var ExecuteStep = func(step *gauge.Step, specDir []string) int {
 		}
 	}()
 
-	// Find the spec and scenario containing this step
-	specs, err := findSpecsContainingStep(step, specDir)
+	// Validate step implementation
+	stepValue, err := parser.ExtractStepValueAndParams(step.LineText, step.HasInlineTable)
 	if err != nil {
-		logger.Errorf(true, "Failed to find specs containing step: %v", err)
-		return ExecutionFailed
-	}
-
-	errMap := gauge.NewBuildErrors()
-	validationStatus := validateSpecs(specs, errMap, r)
-
-	if !validationStatus.Ok {
-		if validationStatus.ParseErrors {
-			return ParseFailed
-		}
+		logger.Errorf(true, "Failed to parse step: %s", err.Error())
 		return ValidationFailed
 	}
 
-	if specs.Size() < 1 {
-		logger.Infof(true, "No specifications found in %s.", strings.Join(specDir, ", "))
-		err := r.Kill()
-		if err != nil {
-			logger.Errorf(false, "unable to kill runner: %s", err.Error())
-		}
-		if validationStatus.Ok {
-			return Success
-		}
-		return ExecutionFailed
+	protoStepValue := gauge.ConvertToProtoStepValue(stepValue)
+	validateReq := &gauge_messages.Message{
+		MessageType: gauge_messages.Message_StepValidateRequest,
+		StepValidateRequest: &gauge_messages.StepValidateRequest{
+			StepText:           stepValue.ParameterizedStepValue,
+			NumberOfParameters: int32(len(stepValue.Args)),
+			StepValue:          protoStepValue,
+		},
+	}
+
+	response, err := r.ExecuteMessageWithTimeout(validateReq)
+	fmt.Printf("Step Value: %+v\n", stepValue)
+	fmt.Printf("Validation Request: %+v\n", validateReq.GetStepValidateRequest())
+	fmt.Printf("Response: %+v\n", response)
+	if err != nil {
+		logger.Errorf(true, "Step validation failed: %s", err.Error())
+		return ValidationFailed
+	}
+
+	if response.GetStepValidateResponse().GetErrorMessage() != "" {
+		logger.Errorf(true, "Step validation failed: %s", response.GetStepValidateResponse().GetErrorMessage())
+		return ValidationFailed
 	}
 
 	event.InitRegistry()
@@ -176,10 +177,24 @@ var ExecuteStep = func(step *gauge.Step, specDir []string) int {
 	}
 	defer wg.Wait()
 
-	ei := newExecutionInfo(specs, r, nil, errMap, InParallel, 0)
-	e := ei.getExecutor()
-	logger.Debug(true, "Run started")
-	return printExecutionResult(e.run(), validationStatus.Ok)
+	executor := &stepExecutor{
+		runner: r,
+		currentExecutionInfo: &gauge_messages.ExecutionInfo{
+			CurrentSpec: &gauge_messages.SpecInfo{
+				Name:     "Single Step Execution",
+				FileName: step.FileName,
+			},
+		},
+		stream: 0,
+	}
+
+	protoStep := gauge.ConvertToProtoItem(step).GetStep()
+	stepResult := executor.executeStep(step, protoStep)
+
+	if stepResult.GetFailed() {
+		return ExecutionFailed
+	}
+	return Success
 }
 
 // findSpecsContainingStep parses all specs in the given directories and returns the ones containing the given step
