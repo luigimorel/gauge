@@ -7,20 +7,19 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/getgauge/common"
 	"github.com/getgauge/gauge-proto/go/gauge_messages"
 	"github.com/getgauge/gauge/api"
 	"github.com/getgauge/gauge/config"
-	"github.com/getgauge/gauge/env"
 	"github.com/getgauge/gauge/execution/event"
 	"github.com/getgauge/gauge/execution/result"
 	"github.com/getgauge/gauge/gauge"
 	"github.com/getgauge/gauge/logger"
+	"github.com/getgauge/gauge/manifest"
 	"github.com/getgauge/gauge/parser"
+	"github.com/getgauge/gauge/plugin"
 	"github.com/getgauge/gauge/plugin/install"
-	"github.com/getgauge/gauge/reporter"
 	"github.com/getgauge/gauge/runner"
 	"github.com/getgauge/gauge/skel"
 	"github.com/getgauge/gauge/validation"
@@ -127,6 +126,12 @@ var ExecuteStep = func(step *gauge.Step, specDir []string) int {
 		logger.Fatalf(true, "failed to set env %s. %s", gaugeParallelStreamCountEnv, err.Error())
 	}
 
+	spec, scenario, err := findSpecAndScenario(step, specDir)
+	if err != nil {
+		logger.Errorf(true, "Failed to find spec and scenario: %v", err)
+		return ExecutionFailed
+	}
+
 	r := startAPI(false)
 	if r == nil {
 		return ExecutionFailed
@@ -138,54 +143,29 @@ var ExecuteStep = func(step *gauge.Step, specDir []string) int {
 		}
 	}()
 
-	// Validate step implementation
-	stepValue, err := parser.ExtractStepValueAndParams(step.LineText, step.HasInlineTable)
-	if err != nil {
-		logger.Errorf(true, "Failed to parse step: %s", err.Error())
-		return ValidationFailed
-	}
-
-	protoStepValue := gauge.ConvertToProtoStepValue(stepValue)
-	validateReq := &gauge_messages.Message{
-		MessageType: gauge_messages.Message_StepValidateRequest,
-		StepValidateRequest: &gauge_messages.StepValidateRequest{
-			StepText:           stepValue.ParameterizedStepValue,
-			NumberOfParameters: int32(len(stepValue.Args)),
-			StepValue:          protoStepValue,
+	executionInfo := &gauge_messages.ExecutionInfo{
+		CurrentSpec: &gauge_messages.SpecInfo{
+			Name:     spec.Heading.Value,
+			FileName: spec.FileName,
+		},
+		CurrentScenario: &gauge_messages.ScenarioInfo{
+			Name: scenario.Heading.Value,
 		},
 	}
 
-	response, err := r.ExecuteMessageWithTimeout(validateReq)
-	fmt.Printf("Step Value: %+v\n", stepValue)
-	fmt.Printf("Validation Request: %+v\n", validateReq.GetStepValidateRequest())
-	fmt.Printf("Response: %+v\n", response)
+	// Initialize plugin handler
+	m, err := manifest.ProjectManifest()
 	if err != nil {
-		logger.Errorf(true, "Step validation failed: %s", err.Error())
-		return ValidationFailed
+		logger.Errorf(true, "Failed to get project manifest: %v", err)
+		return ExecutionFailed
 	}
-
-	if response.GetStepValidateResponse().GetErrorMessage() != "" {
-		logger.Errorf(true, "Step validation failed: %s", response.GetStepValidateResponse().GetErrorMessage())
-		return ValidationFailed
-	}
-
-	event.InitRegistry()
-	wg := &sync.WaitGroup{}
-	reporter.ListenExecutionEvents(wg)
-	if env.SaveExecutionResult() {
-		ListenSuiteEndAndSaveResult(wg)
-	}
-	defer wg.Wait()
+	handler := plugin.StartPlugins(m)
 
 	executor := &stepExecutor{
-		runner: r,
-		currentExecutionInfo: &gauge_messages.ExecutionInfo{
-			CurrentSpec: &gauge_messages.SpecInfo{
-				Name:     "Single Step Execution",
-				FileName: step.FileName,
-			},
-		},
-		stream: 0,
+		runner:               r,
+		pluginHandler:        handler,
+		currentExecutionInfo: executionInfo,
+		stream:               0,
 	}
 
 	protoStep := gauge.ConvertToProtoItem(step).GetStep()
@@ -197,7 +177,6 @@ var ExecuteStep = func(step *gauge.Step, specDir []string) int {
 	return Success
 }
 
-// findSpecsContainingStep parses all specs in the given directories and returns the ones containing the given step
 func findSpecsContainingStep(step *gauge.Step, specDirs []string) (*gauge.SpecCollection, error) {
 	conceptDict, res, err := parser.ParseConcepts()
 	if err != nil {
@@ -227,16 +206,13 @@ func findSpecsContainingStep(step *gauge.Step, specDirs []string) (*gauge.SpecCo
 	return gauge.NewSpecCollection(matchingSpecs, false), nil
 }
 
-// containsStep checks if the given spec contains the step
 func containsStep(spec *gauge.Specification, targetStep *gauge.Step) bool {
-	// Check context steps
 	for _, step := range spec.Contexts {
 		if stepsEqual(step, targetStep) {
 			return true
 		}
 	}
 
-	// Check scenario steps
 	for _, scenario := range spec.Scenarios {
 		for _, step := range scenario.Steps {
 			if stepsEqual(step, targetStep) {
@@ -245,7 +221,6 @@ func containsStep(spec *gauge.Specification, targetStep *gauge.Step) bool {
 		}
 	}
 
-	// Check teardown steps
 	for _, step := range spec.TearDownSteps {
 		if stepsEqual(step, targetStep) {
 			return true
@@ -255,12 +230,10 @@ func containsStep(spec *gauge.Specification, targetStep *gauge.Step) bool {
 	return false
 }
 
-// stepsEqual checks if two steps are equal by comparing their values and line numbers
 func stepsEqual(step1, step2 *gauge.Step) bool {
 	return step1.Value == step2.Value && step1.LineNo == step2.LineNo
 }
 
-// validateSpecs validates the specs using the runner
 func validateSpecs(specs *gauge.SpecCollection, errMap *gauge.BuildErrors, r runner.Runner) *ValidationStatus {
 	conceptDict, res, err := parser.ParseConcepts()
 	if err != nil {
@@ -318,4 +291,30 @@ func ExecuteSingleStep(e *stepExecutor, step *gauge.Step, protoStep *gauge_messa
 	event.Notify(event.NewExecutionEvent(event.StepEnd, *step, stepResult, e.stream, e.currentExecutionInfo))
 	defer e.currentExecutionInfo.CurrentStep.Reset()
 	return stepResult
+}
+
+func findSpecAndScenario(step *gauge.Step, specDirs []string) (*gauge.Specification, *gauge.Scenario, error) {
+	conceptDict, res, err := parser.ParseConcepts()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to parse concepts: %w", err)
+	}
+	if !res.Ok {
+		return nil, nil, fmt.Errorf("failed to parse concepts")
+	}
+
+	errMap := gauge.NewBuildErrors()
+	specs, specsFailed := parser.ParseSpecs(specDirs, conceptDict, errMap)
+	if specsFailed {
+		return nil, nil, fmt.Errorf("failed to parse specs")
+	}
+
+	for _, spec := range specs {
+		for _, scenario := range spec.Scenarios {
+			if step.LineNo >= scenario.Span.Start && step.LineNo <= scenario.Span.End {
+				return spec, scenario, nil
+			}
+		}
+	}
+
+	return nil, nil, fmt.Errorf("no scenario found containing step at line %d", step.LineNo)
 }
